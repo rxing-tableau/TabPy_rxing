@@ -1,5 +1,6 @@
 from tabpy.tabpy_server.handlers import BaseHandler
 import logging
+import threading
 import time
 from tabpy.tabpy_server.common.messages import (
     Query,
@@ -14,7 +15,8 @@ from tabpy.tabpy_server.common.util import format_exception
 import urllib
 from tornado import gen
 from tabpy.tabpy_server.handlers.util import AuthErrorStates
-
+from tabpy.tabpy_server.explainers.shap_explainer import ShapExplainer
+from tabpy.tabpy_server.explainers.predict_model import PrediectModel
 
 def _get_uuid():
     """Generate a unique identifier string"""
@@ -88,6 +90,7 @@ class QueryPlaneHandler(BaseHandler):
                 "model": po_name,
                 "uuid": uid,
             }
+
             self.write(result_dict)
             self.finish()
             return (gls_time, response["response"])
@@ -125,6 +128,17 @@ class QueryPlaneHandler(BaseHandler):
 
     def _process_query(self, endpoint_name, start):
         self.logger.log(logging.DEBUG, f"Processing query {endpoint_name}...")
+
+        explain_token = self.request.headers.get("Explain-Token", None)
+        if explain_token is not None:
+            shap_values = self._fetch_explanations(explain_token)
+            result_dict = {
+                "shap_values": shap_values.tolist()
+            }
+            self.write(result_dict)
+            self.finish()
+            return
+
         try:
             self._add_CORS_header()
 
@@ -172,7 +186,11 @@ class QueryPlaneHandler(BaseHandler):
             qry = Query(po_name, request_json)
             gls_time = 0
             # send a query to PythonService and return
-            (gls_time, _) = self._handle_result(po_name, data, qry, uid)
+            (gls_time, response) = self._handle_result(po_name, data, qry, uid)
+
+            need_explain = self.request.headers.get("Explain-Prediction", None)
+            if need_explain is not None and need_explain:
+                self._explain_prediction(po_name, data, uid)
 
             # if error occurred, GLS time is None.
             if not gls_time:
@@ -210,6 +228,16 @@ class QueryPlaneHandler(BaseHandler):
                 return
 
         return (endpoint_name, all_endpoint_names)
+
+    def _explain_prediction(self, po_name, data, uuid):
+        # start a daemon thread for explanations
+        model = PrediectModel(self, po_name, uuid)
+        explain = threading.Thread(name='ShapExplainer', target=ShapExplainer.explain, args=(model.predict, data, uuid))
+        explain.setDaemon(True)
+        explain.start()
+
+    def _fetch_explanations(self, token):
+        return ShapExplainer.query_shap_values(token)
 
     @gen.coroutine
     def get(self, endpoint_name):
